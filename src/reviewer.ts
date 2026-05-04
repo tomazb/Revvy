@@ -713,6 +713,55 @@ function estimateTokens(textOrLength: string | number): number {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * Replaces raw control characters (0x00–0x1F) embedded inside JSON string
+ * literals with their proper JSON escape sequences.
+ *
+ * Some AI backends occasionally emit literal newlines or other control chars
+ * inside string values instead of \n / \t / etc., which causes JSON.parse to
+ * throw "Bad control character in string literal".  This pass fixes that
+ * before we attempt parsing, without touching whitespace outside strings.
+ */
+function sanitizeControlChars(raw: string): string {
+  let inString = false;
+  let escape   = false;
+  let result   = '';
+
+  for (let i = 0; i < raw.length; i++) {
+    const ch   = raw[i];
+    const code = raw.charCodeAt(i);
+
+    if (escape) {
+      escape = false;
+      result += ch;
+      continue;
+    }
+    if (ch === '\\') {
+      escape = true;
+      result += ch;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      result += ch;
+      continue;
+    }
+    if (inString && code < 0x20) {
+      switch (code) {
+        case 0x08: result += '\\b'; break;
+        case 0x09: result += '\\t'; break;
+        case 0x0A: result += '\\n'; break;
+        case 0x0C: result += '\\f'; break;
+        case 0x0D: result += '\\r'; break;
+        default:   result += `\\u${code.toString(16).padStart(4, '0')}`; break;
+      }
+      continue;
+    }
+    result += ch;
+  }
+  return result;
+}
+
+/**
  * Attempts to repair truncated JSON by auto-closing open structures.
  * AI responses often hit max_tokens mid-stream, producing incomplete JSON like:
  *   {"verdict":"REQUEST_CHANGES","summary":"fix the
@@ -785,6 +834,11 @@ function parseReviewResponse(
   let clean = raw.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
   const jsonMatch = clean.match(/\{[\s\S]*\}/);
   if (jsonMatch) { clean = jsonMatch[0]; }
+
+  // Sanitize raw control characters the AI may embed inside string values.
+  // Must run before JSON.parse — and before repairTruncatedJson — so both
+  // parse attempts operate on valid character sequences.
+  clean = sanitizeControlChars(clean);
 
   let parsed: any;
   try {

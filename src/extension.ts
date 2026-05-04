@@ -99,6 +99,8 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!loader) { return; }
       const profiles = await loader.loadAll();
       vscode.window.showInformationMessage(`Reloaded ${profiles.length} profiles`);
+      const label = activeRequirements ? buildRequirementsLabel(activeRequirements.text) : '';
+      panelProvider.showWelcome(!!activeRequirements, label);
     })
   );
 

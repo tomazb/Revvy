@@ -55,6 +55,9 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
           // Delegate to extension so it can inject the current requirements state
           vscode.commands.executeCommand('revvy.goHome');
           break;
+        case 'reloadRules':
+          vscode.commands.executeCommand('revvy.reloadRules');
+          break;
         case 'clearRequirements':
           vscode.commands.executeCommand('revvy.clearTicketRequirements');
           break;
@@ -1152,6 +1155,9 @@ body {
         <button class="btn-secondary" onclick="vscode.postMessage({type:'openRules'})">
           ${this.icons.folderOpen}<span>Open Rules Folder</span>
         </button>
+        <button class="btn-secondary" onclick="vscode.postMessage({type:'reloadRules'})">
+          ${this.icons.refreshCw}<span>Reload Rules</span>
+        </button>
         ${requirementsActive ? `
         <button class="btn-secondary btn-req-active" onclick="vscode.postMessage({type:'setTicket'})">
           ${this.icons.clipboard}<span>Set Requirements</span>
@@ -1615,7 +1621,18 @@ body {
           .join('\n');
       }
 
-      const lineRange      = c.endLine && c.endLine !== c.line ? `L${c.line}–${c.endLine}` : `L${c.line}`;
+      // For local reviews, correct line numbers using the fragment-search helper
+      // so the badge, openFile handler, and code block all show the same position.
+      const fileLines = isRemote ? undefined : fileLinesCache.get(c.file);
+      const { flagFirst: displayFirst, flagLast: displayLast } =
+        (!isRemote && fileLines && fileLines.length > 0 && c.codeFragment)
+          ? this.resolveLocalLines(fileLines, c.line, c.endLine, c.codeFragment)
+          : { flagFirst: c.line, flagLast: c.endLine ?? c.line };
+
+      const lineRange = displayLast !== displayFirst
+        ? `L${displayFirst}–${displayLast}`
+        : `L${displayFirst}`;
+
       // FIX 4: use pre-cached lines — no redundant readFile per comment.
       // For remote reviews, render from the diff context stored on the comment.
       let codeSnippet: string;
@@ -1625,14 +1642,14 @@ body {
           ? this.renderDiffContext(c.codeContext, c.codeContextStartLine ?? c.line, c.line, c.endLine, c.codeFragment)
           : `<div class="card-code-unavailable">Diff unavailable for ${escapedFile} line ${c.line}.</div>`;
       } else {
-        const fileLines = fileLinesCache.get(c.file);
-        codeSnippet = this.renderCodeLine(fileLines, c.line, c.endLine, c.codeFragment);
+        // Pass corrected line numbers; omit codeFragment (correction already done above).
+        codeSnippet = this.renderCodeLine(fileLines, displayFirst, displayLast);
       }
 
       // Remote cards are inert — no local file to navigate to.
       const cardInteraction = isRemote
         ? `style="cursor:default" title="${escapedFile}"`
-        : `onclick="openFile('${this.escapeJs(c.file)}', ${c.line})" title="Open ${escapedFile}"`;
+        : `onclick="openFile('${this.escapeJs(c.file)}', ${displayFirst})" title="Open ${escapedFile}"`;
 
       return `
       <div class="review-card sev-${sev}" data-sev="${sev}"
@@ -2358,31 +2375,32 @@ body {
     }).join('');
   }
 
-  private renderCodeLine(
-    fileLines: string[] | undefined,
+  /**
+   * Resolves the true flagged line range for a local review comment.
+   *
+   * Starts from the AI-reported startLine/endLine, then — when a codeFragment
+   * is provided — searches ±50 lines in the actual file to find where the
+   * fragment actually lives and corrects both flagFirst and flagLast accordingly.
+   *
+   * Used by renderCodeLine() internally AND by renderComment() so the badge
+   * and openFile handler reflect the same corrected position as the code block.
+   */
+  private resolveLocalLines(
+    fileLines: string[],
     startLine: number,
     endLine: number | undefined,
     codeFragment?: string,
-  ): string {
-    if (!fileLines || fileLines.length === 0) {
-      return `<div class="card-code-unavailable">Source file not found in workspace.</div>`;
-    }
-
+  ): { flagFirst: number; flagLast: number } {
     const total = fileLines.length;
-
-    // Normalise: AI sometimes returns 0-based line numbers
     let flagFirst = startLine <= 0 ? 1 : Math.min(startLine, total);
     let flagLast  = (endLine !== undefined && endLine > 0)
       ? Math.min(total, Math.max(flagFirst, endLine))
       : flagFirst;
 
-    // If the AI provided a verbatim code fragment, search for it within a
-    // ±10-line window around the AI-reported line to find the true position.
-    // This corrects cases where the AI's line number is off by a few lines.
     if (codeFragment) {
       const fragFirstLine = codeFragment.split('\n')[0].replace(/^[+\- ]/, '').trim();
       const fragLineCount = codeFragment.split('\n').length;
-      const MIN_FRAG_LEN = 8;
+      const MIN_FRAG_LEN  = 8;
       if (fragFirstLine.length >= MIN_FRAG_LEN) {
         const searchStart = Math.max(1, flagFirst - 50);
         const searchEnd   = Math.min(total, flagFirst + 50);
@@ -2395,6 +2413,25 @@ body {
         }
       }
     }
+
+    return { flagFirst, flagLast };
+  }
+
+  private renderCodeLine(
+    fileLines: string[] | undefined,
+    startLine: number,
+    endLine: number | undefined,
+    codeFragment?: string,
+  ): string {
+    if (!fileLines || fileLines.length === 0) {
+      return `<div class="card-code-unavailable">Source file not found in workspace.</div>`;
+    }
+
+    const total = fileLines.length;
+
+    // Delegate correction to the shared helper (also used by renderComment for
+    // the badge and openFile handler, so all three stay in sync).
+    let { flagFirst, flagLast } = this.resolveLocalLines(fileLines, startLine, endLine, codeFragment);
 
     // If the flagged range is all blank, scan ±5 for nearest non-empty line
     const rangeBlank = (a: number, b: number) => {
@@ -2469,7 +2506,7 @@ body {
     // of the AI's (sometimes inaccurate) line number.
     if (codeFragment) {
       const fragFirstLine = codeFragment.split('\n')[0].replace(/^[+\- ]/, '').trim();
-      const fragLineCount = codeFragment.split('\n').length;
+      const fragLineCount = codeFragment.trimEnd().split('\n').length;
       const MIN_FRAG_LEN = 8;
       if (fragFirstLine.length >= MIN_FRAG_LEN) {
         for (let i = 0; i < lines.length; i++) {

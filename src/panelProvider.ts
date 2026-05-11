@@ -78,6 +78,14 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
           webviewView.webview.postMessage({ type: 'reviewMode', mode: savedMode });
           break;
         }
+        case 'setReviewScope':
+          await this.context.workspaceState.update('revvy.reviewScope', msg.scope);
+          break;
+        case 'getReviewScope': {
+          const savedScope = this.context.workspaceState.get<string>('revvy.reviewScope', 'quick');
+          webviewView.webview.postMessage({ type: 'reviewScope', scope: savedScope });
+          break;
+        }
 
         // ── Configuration screen ──────────────────────────────────────────────
         case 'openConfigure':
@@ -1135,6 +1143,21 @@ body {
         </button>
       </div>
 
+      <!-- Review depth selector (Quick / Deep) -->
+      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
+        <div class="model-section-label">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          Review depth
+        </div>
+        <div class="filter-group">
+          <button id="scope-quick" class="filter-chip active">Quick</button>
+          <button id="scope-deep" class="filter-chip">Deep</button>
+        </div>
+        <p id="deep-disclaimer" style="margin:8px 0 0;font-size:10px;color:var(--fg-subtle);line-height:1.5" hidden>
+          Deep Review explores the workspace with read-only tools (up to 20 calls) before producing the report. Requires GitHub Copilot.
+        </p>
+      </div>
+
       <!-- Review mode selector -->
       <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
         <div class="model-section-label">
@@ -1222,6 +1245,16 @@ body {
           aiob.classList.toggle('active', msg.mode === 'all_in_one');
         }
       }
+      if (msg.type === 'reviewScope') {
+        const qb = document.getElementById('scope-quick');
+        const db = document.getElementById('scope-deep');
+        const disc = document.getElementById('deep-disclaimer');
+        if (qb && db) {
+          qb.classList.toggle('active', msg.scope === 'quick');
+          db.classList.toggle('active', msg.scope === 'deep');
+        }
+        if (disc) { disc.hidden = msg.scope !== 'deep'; }
+      }
     });
     vscode.postMessage({ type: 'requestModels' });
     (function setupModeToggle() {
@@ -1236,6 +1269,21 @@ body {
       pfb.addEventListener('click', function() { setMode('per_file'); });
       aiob.addEventListener('click', function() { setMode('all_in_one'); });
       vscode.postMessage({ type: 'getReviewMode' });
+    })();
+    (function setupScopeToggle() {
+      const qb = document.getElementById('scope-quick');
+      const db = document.getElementById('scope-deep');
+      const disc = document.getElementById('deep-disclaimer');
+      if (!qb || !db) { return; }
+      function setScope(scope) {
+        qb.classList.toggle('active', scope === 'quick');
+        db.classList.toggle('active', scope === 'deep');
+        if (disc) { disc.hidden = scope !== 'deep'; }
+        vscode.postMessage({ type: 'setReviewScope', scope: scope });
+      }
+      qb.addEventListener('click', function() { setScope('quick'); });
+      db.addEventListener('click', function() { setScope('deep'); });
+      vscode.postMessage({ type: 'getReviewScope' });
     })();
   </script>
 </body>
@@ -2025,7 +2073,7 @@ body {
         ${this.icons.copyClipboard}<span>Copy MD</span>
       </button>
     </div>
-    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s</div>
+    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s${r.toolCallsUsed ? ` &middot; ${r.toolCallsUsed} tool calls` : ''}${r.estimatedInputTokens ? ` &middot; ~${r.estimatedInputTokens.toLocaleString()} tokens` : ''}</div>
       </div>
 
 <script>

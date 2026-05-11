@@ -9,6 +9,7 @@ import { execSync, exec } from 'child_process';
 import { promisify } from 'util';
 import { RuleLoader, ReviewProfile } from './ruleLoader';
 import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
+import { runDeepReview } from './deepReviewer';
 import { AIKeys } from './aiBackend';
 import { ReviewPanelProvider } from './panelProvider';
 import { normalizeGitLabDiffResponse, normalizeRemoteDiff } from './diffFilter';
@@ -54,6 +55,14 @@ export async function activate(context: vscode.ExtensionContext) {
   // ── STEP 2: Register all commands ────────────────────────────────────────
   context.subscriptions.push(
     vscode.commands.registerCommand('revvy.reviewDiff', async () => {
+      await reviewDiff();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.deepReview', async () => {
+      // Force scope to 'deep' so runReviewWithProgress() picks the deep path.
+      await context.workspaceState.update('revvy.reviewScope', 'deep');
       await reviewDiff();
     })
   );
@@ -435,8 +444,9 @@ async function runReviewWithProgress(
 
       // Step 3: Send to AI — phase transition uses updateLoading (full HTML rebuild),
       // then all high-frequency token updates use patchLoading (postMessage only).
-      progress.report({ message: 'Analyzing with AI…' });
-      panelProvider.updateLoading('Analyzing changes…', 0.5);
+      const isDeep = extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
+      progress.report({ message: isDeep ? 'Starting Deep Review…' : 'Analyzing with AI…' });
+      panelProvider.updateLoading(isDeep ? 'Starting Deep Review…' : 'Analyzing changes…', 0.5);
 
       // Count the number of reviewable files so the counter can show "2/4 files"
       const fileLinesCount = (diff.match(/^diff --git /gm) || []).length;
@@ -447,24 +457,49 @@ async function runReviewWithProgress(
         let filesDone  = 0;
         let lastReportedToken = 0;
 
+        // For Deep Review, track the current activity label separately so
+        // tool-call notifications can update it immediately without waiting
+        // for the 40-char throttle that drives normal token-counter updates.
+        let deepLabel = isDeep ? 'Exploring workspace…' : '';
+
         const onChunk = (chunk: string) => {
           tokenCount += chunk.length;
+
+          if (isDeep) {
+            // Detect "[Turn X/Y, tool Z/W: toolName]" emitted by deepReviewer on each tool call.
+            // Fire an immediate patchLoading so the user sees the active tool name right away.
+            const m = chunk.match(/\[Turn (\d+)\/\d+, tool (\d+)\/(\d+): ([^\]]+)\]/);
+            if (m) {
+              deepLabel = `Exploring: ${m[4]} (tool ${m[2]}/${m[3]})`;
+              progress.report({ message: deepLabel });
+              panelProvider.patchLoading(deepLabel, Math.round(tokenCount / 4), filesTotal, filesDone);
+              lastReportedToken = tokenCount;
+              return; // skip the normal throttle path for this chunk
+            }
+            // Context-cap and budget-exhaustion finalise signals
+            if (chunk.includes('Context limit reached') || chunk.includes('Tool budget reached')) {
+              deepLabel = 'Finalizing review…';
+            }
+          }
+
           if (tokenCount - lastReportedToken >= 40) {
             lastReportedToken = tokenCount;
             const approxTokens = Math.round(tokenCount / 4);
-            const label = `Generating report…`;
+            const label = isDeep ? deepLabel : 'Generating report…';
             progress.report({ message: `${label} (~${approxTokens} tokens)` });
             panelProvider.patchLoading(label, approxTokens, filesTotal, filesDone);
           }
         };
 
-        const result = await runReview(
-          diff, profileWithReqs, undefined, keys, onChunk,
-          // Resolve commit-style rules once per review — never for remote reviews
-          // (sources=undefined here means this is always a local diff review).
-          ruleLoader?.getProfile('commit-style')?.rules.filter(r => r.enabled) ?? [],
-          extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
-        );
+        const result = isDeep
+          ? await runDeepReview(diff, profileWithReqs, keys, onChunk)
+          : await runReview(
+              diff, profileWithReqs, undefined, keys, onChunk,
+              // Resolve commit-style rules once per review — never for remote reviews
+              // (sources=undefined here means this is always a local diff review).
+              ruleLoader?.getProfile('commit-style')?.rules.filter(r => r.enabled) ?? [],
+              extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
+            );
 
         if (result.filterStats && result.filterStats.skippedFiles > 0) {
           console.log(
@@ -1122,9 +1157,17 @@ async function reviewMultiMR() {
           }
         };
 
+        // Deep Review is intentionally not supported for remote diffs: its workspace
+        // tools (readFile, searchSymbol, …) operate on the LOCAL filesystem, which
+        // has no guaranteed relation to the remote repo being reviewed.
+        // Always use Quick Review for multi-repo / remote MR reviews.
         const result = await runReview(
-          combinedDiff, profileWithReqs, sources, keys, onChunk,
-          undefined,
+          combinedDiff,
+          profileWithReqs,
+          sources,
+          keys,
+          onChunk,
+          undefined,  // no commit rules for remote reviews (reviewer.ts already guards isRemote)
           extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
         );
 

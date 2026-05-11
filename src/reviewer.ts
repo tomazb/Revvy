@@ -310,6 +310,8 @@ export interface ReviewResult {
   // PERF — token estimation for diagnostics
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
+  /** Deep Review only: number of workspace tool calls executed in the agent loop. */
+  toolCallsUsed?: number;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

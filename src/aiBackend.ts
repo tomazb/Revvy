@@ -138,7 +138,7 @@ async function callOpenAI(
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: prompt },
     ],
-    max_tokens: 32768,   // P1: raised to 32K — large diffs with many rules need more output room
+    max_tokens: vscode.workspace.getConfiguration('revvy').get<number>('ai.maxTokensOpenAI', 32768),
     temperature: 0.1,
     stream: useStreaming,
   };
@@ -216,7 +216,7 @@ async function callAnthropic(
     },
     body: JSON.stringify({
       model,
-      max_tokens: 16384,   // P1: raised to 16K — large diffs need more output room
+      max_tokens: vscode.workspace.getConfiguration('revvy').get<number>('ai.maxTokensAnthropic', 16384),   // configurable via revvy.ai.maxTokensAnthropic
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
       stream: useStreaming,

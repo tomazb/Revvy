@@ -29,10 +29,7 @@ import {
 // Cost-control constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const MAX_AGENT_ROUNDS               = 30;
-const MAX_TOOL_CALLS                 = 50;
 const MAX_TOOL_RESULT_CHARS          = 12_000;
-const MAX_CONVERSATION_CHARS         = 200_000;
 // Tight trim for programmatic grounding searches — we only need the #define
 // line, not 12 KB of surrounding code.
 const GROUNDING_SYMBOL_RESULT_CHARS  = 3_000;
@@ -890,6 +887,12 @@ export async function runDeepReview(
   sources?: ReviewSource[],
 ): Promise<ReviewResult> {
   if (!diff.trim()) { throw new Error('No diff to review'); }
+
+  // ── Cost-control limits (user-configurable via VS Code settings) ──────────
+  const cfg = vscode.workspace.getConfiguration('revvy');
+  const MAX_AGENT_ROUNDS       = cfg.get<number>('deepReview.maxAgentRounds', 30);
+  const MAX_TOOL_CALLS         = cfg.get<number>('deepReview.maxToolCalls', 50);
+  const MAX_CONVERSATION_CHARS = cfg.get<number>('deepReview.maxConversationChars', 200_000);
 
   // ── Select model (same logic as callCopilot in aiBackend.ts) ─────────────
   const selectedModelId = vscode.workspace.getConfiguration('revvy').get<string>('selectedModelId', '');

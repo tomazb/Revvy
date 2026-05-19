@@ -166,6 +166,24 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
             .update('allowInsecureTls', !!msg.value, vscode.ConfigurationTarget.Global);
           webviewView.webview.postMessage({ type: 'saveAck', field: 'allow-insecure-tls' });
           break;
+
+        case 'saveMaxAgentRounds':
+          await vscode.workspace.getConfiguration('revvy')
+            .update('deepReview.maxAgentRounds', Number(msg.value), vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'max-agent-rounds' });
+          break;
+
+        case 'saveMaxToolCalls':
+          await vscode.workspace.getConfiguration('revvy')
+            .update('deepReview.maxToolCalls', Number(msg.value), vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'max-tool-calls' });
+          break;
+
+        case 'saveMaxConvChars':
+          await vscode.workspace.getConfiguration('revvy')
+            .update('deepReview.maxConversationChars', Number(msg.value), vscode.ConfigurationTarget.Global);
+          webviewView.webview.postMessage({ type: 'saveAck', field: 'max-conv-chars' });
+          break;
       }
     });
   }
@@ -1018,6 +1036,10 @@ body {
     requirementsLabel = ''
   ): string {
     const profile = vscode.workspace.getConfiguration('revvy').get<string>('activeProfile', 'c-embedded');
+    const revvyCfg       = vscode.workspace.getConfiguration('revvy');
+    const maxAgentRounds = revvyCfg.get<number>('deepReview.maxAgentRounds', 30);
+    const maxToolCalls   = revvyCfg.get<number>('deepReview.maxToolCalls', 50);
+    const maxConvChars   = revvyCfg.get<number>('deepReview.maxConversationChars', 200_000);
     const logoPngUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'resources', 'home_icon.png')
     ).toString();
@@ -1124,6 +1146,11 @@ body {
   .model-select:hover { border-color: #8b949e; background: var(--bg-muted); }
   .model-select:focus { outline: none; border-color: var(--accent-fg); box-shadow: 0 0 0 3px rgba(88,166,255,0.15); }
   .model-select:disabled { opacity: 0.5; cursor: default; }
+
+  /* ── Deep Review limit inputs — hide number spinners ── */
+  #deep-review-limits input[type=number]::-webkit-inner-spin-button,
+  #deep-review-limits input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  #deep-review-limits input[type=number] { appearance: textfield; }
 </style>
 </head>
 <body>
@@ -1153,9 +1180,23 @@ body {
           <button id="scope-quick" class="filter-chip active">Quick</button>
           <button id="scope-deep" class="filter-chip">Deep</button>
         </div>
-        <p id="deep-disclaimer" style="margin:8px 0 0;font-size:10px;color:var(--fg-subtle);line-height:1.5" hidden>
-          Deep Review explores the workspace with read-only tools (up to 20 calls) before producing the report. Requires GitHub Copilot.
-        </p>
+        <div id="deep-review-limits" style="margin:10px 0 0;display:none;flex-direction:column;gap:7px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <input id="deep-max-agent-rounds" type="number" min="1" step="1" value="${maxAgentRounds}"
+              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
+            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">Agent rounds</label>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input id="deep-max-tool-calls" type="number" min="1" step="1" value="${maxToolCalls}"
+              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
+            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">Tool calls</label>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input id="deep-max-conv-chars" type="number" min="10000" step="10000" value="${maxConvChars}"
+              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
+            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">History (chars)</label>
+          </div>
+        </div>
       </div>
 
       <!-- Review mode selector -->
@@ -1249,11 +1290,13 @@ body {
         const qb = document.getElementById('scope-quick');
         const db = document.getElementById('scope-deep');
         const disc = document.getElementById('deep-disclaimer');
+        const limits = document.getElementById('deep-review-limits');
         if (qb && db) {
           qb.classList.toggle('active', msg.scope === 'quick');
           db.classList.toggle('active', msg.scope === 'deep');
         }
         if (disc) { disc.hidden = msg.scope !== 'deep'; }
+        if (limits) { limits.style.display = msg.scope === 'deep' ? 'flex' : 'none'; }
       }
     });
     vscode.postMessage({ type: 'requestModels' });
@@ -1274,16 +1317,35 @@ body {
       const qb = document.getElementById('scope-quick');
       const db = document.getElementById('scope-deep');
       const disc = document.getElementById('deep-disclaimer');
+      const limits = document.getElementById('deep-review-limits');
       if (!qb || !db) { return; }
       function setScope(scope) {
         qb.classList.toggle('active', scope === 'quick');
         db.classList.toggle('active', scope === 'deep');
         if (disc) { disc.hidden = scope !== 'deep'; }
+        if (limits) { limits.style.display = scope === 'deep' ? 'flex' : 'none'; }
         vscode.postMessage({ type: 'setReviewScope', scope: scope });
       }
       qb.addEventListener('click', function() { setScope('quick'); });
       db.addEventListener('click', function() { setScope('deep'); });
       vscode.postMessage({ type: 'getReviewScope' });
+
+      // Save Deep Review limits on blur
+      function saveNumOnBlur(id, msgType) {
+        const el = document.getElementById(id);
+        if (!el) { return; }
+        let lastVal = el.value;
+        el.addEventListener('blur', function() {
+          const v = el.value;
+          if (v !== lastVal && v !== '' && Number(v) >= 1) {
+            lastVal = v;
+            vscode.postMessage({ type: msgType, value: Number(v) });
+          }
+        });
+      }
+      saveNumOnBlur('deep-max-agent-rounds', 'saveMaxAgentRounds');
+      saveNumOnBlur('deep-max-tool-calls',   'saveMaxToolCalls');
+      saveNumOnBlur('deep-max-conv-chars',   'saveMaxConvChars');
     })();
   </script>
 </body>

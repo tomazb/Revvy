@@ -1120,7 +1120,10 @@ async function forceFinalize(
     onChunk?.(chunk);
   }
 
-  return parseDeepReviewResponse(finalText, profile, durationMs);
+  const result = parseDeepReviewResponse(finalText, profile, durationMs);
+  // Model-accurate output token count (best-effort) for the cost estimate.
+  try { result.estimatedOutputTokens = await model.countTokens(finalText); } catch { /* leave undefined */ }
+  return result;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1142,8 +1145,16 @@ export async function runDeepReview(
   // ── Cost-control limits (user-configurable via VS Code settings) ──────────
   const cfg = vscode.workspace.getConfiguration('revvy');
   const MAX_AGENT_ROUNDS       = cfg.get<number>('deepReview.maxAgentRounds', 30);
-  const MAX_TOOL_CALLS         = cfg.get<number>('deepReview.maxToolCalls', 50);
-  const MAX_CONVERSATION_CHARS = cfg.get<number>('deepReview.maxConversationChars', 200_000);
+  // Tool calls run locally (free) and the conversation cap below bounds the
+  // token cost regardless, so this can be generous.
+  const MAX_TOOL_CALLS         = cfg.get<number>('deepReview.maxToolCalls', 100);
+  // Optional manual override for the conversation cap; 0 (default) = auto-fit to
+  // the selected model's context window (computed once the model is known).
+  const convCharsOverride      = cfg.get<number>('deepReview.maxConversationChars', 0);
+  // Stall watchdog: max time to wait for any stream activity in a single round
+  // before cancelling. Without this the loop can hang indefinitely on a slow or
+  // stalled Copilot stream (shows up as "stuck at ROUND N" with no progress).
+  const STREAM_STALL_MS        = cfg.get<number>('deepReview.streamStallTimeoutMs', 120_000);
 
   // ── Select model (same logic as callCopilot in aiBackend.ts) ─────────────
   const selectedModelId = vscode.workspace.getConfiguration('revvy').get<string>('selectedModelId', '');
@@ -1156,6 +1167,19 @@ export async function runDeepReview(
   const model = selectedModelId
     ? (allModels.find((m: any) => m.id === selectedModelId) ?? allModels[0])
     : allModels[0];
+
+  // ── Conversation cap: model-aware by default ──────────────────────────────
+  // The whole conversation is re-sent every round, so it must stay under the
+  // model's context window or the API rejects the request. Auto-fit to ~80% of
+  // the model's maxInputTokens (≈4 chars/token), leaving headroom for the
+  // model's own reply. A positive `maxConversationChars` setting overrides this;
+  // if the model doesn't report a window we fall back to a safe 200K chars.
+  const CHARS_PER_TOKEN = 4;
+  const modelMaxTokens = typeof model.maxInputTokens === 'number' ? model.maxInputTokens : 0;
+  const MAX_CONVERSATION_CHARS = convCharsOverride > 0
+    ? convCharsOverride
+    : (modelMaxTokens > 0 ? Math.floor(modelMaxTokens * CHARS_PER_TOKEN * 0.8) : 200_000);
+  log(`LIMITS  rounds=${MAX_AGENT_ROUNDS}  toolCalls=${MAX_TOOL_CALLS}  convCharsCap=${MAX_CONVERSATION_CHARS}${convCharsOverride > 0 ? ' (override)' : modelMaxTokens > 0 ? ` (auto: 80% of ${modelMaxTokens} tok)` : ' (fallback)'}`);
 
   // Open the output channel so the user sees logs in real time
   getChannel().show(false);
@@ -1306,24 +1330,51 @@ export async function runDeepReview(
       return result;
     }
 
-    // Send request with tools available
-    const response = await model.sendRequest(
-      messages,
-      { tools: isRemote ? DEEP_REVIEW_TOOLS_REMOTE : DEEP_REVIEW_TOOLS },
-      cts.token
-    );
-
-    // Stream and collect
+    // Stream and collect, guarded by a stall watchdog.
+    // The LM stream has no built-in timeout: a slow or hung Copilot response
+    // would otherwise block this round forever ("stuck at ROUND N"). We cancel
+    // the request if no chunk arrives within STREAM_STALL_MS, resetting the
+    // timer on every chunk so a steadily-streaming response is never killed.
     const textParts: string[] = [];
     const toolCallParts: vscode.LanguageModelToolCallPart[] = [];
 
-    for await (const chunk of response.stream) {
-      if (chunk instanceof vscode.LanguageModelTextPart) {
-        textParts.push(chunk.value);
-        onChunk?.(chunk.value);
-      } else if (chunk instanceof vscode.LanguageModelToolCallPart) {
-        toolCallParts.push(chunk);
+    let stallTimer: NodeJS.Timeout | undefined;
+    const armStall = () => {
+      if (stallTimer) { clearTimeout(stallTimer); }
+      stallTimer = setTimeout(() => {
+        log(`STALL  no stream activity for ${Math.round(STREAM_STALL_MS / 1000)}s at round ${round + 1} — cancelling request`);
+        cts.cancel();
+      }, STREAM_STALL_MS);
+    };
+
+    try {
+      armStall();
+      const response = await model.sendRequest(
+        messages,
+        { tools: isRemote ? DEEP_REVIEW_TOOLS_REMOTE : DEEP_REVIEW_TOOLS },
+        cts.token
+      );
+
+      for await (const chunk of response.stream) {
+        armStall(); // reset the watchdog on every chunk
+        if (chunk instanceof vscode.LanguageModelTextPart) {
+          textParts.push(chunk.value);
+          onChunk?.(chunk.value);
+        } else if (chunk instanceof vscode.LanguageModelToolCallPart) {
+          toolCallParts.push(chunk);
+        }
       }
+    } catch (err: any) {
+      if (cts.token.isCancellationRequested) {
+        throw new Error(
+          `Deep Review stalled at round ${round + 1}: no response from the model within ` +
+          `${Math.round(STREAM_STALL_MS / 1000)}s. The Copilot model may be overloaded or the ` +
+          `request too large — try again, pick a lighter model, or switch to Quick review.`
+        );
+      }
+      throw err;
+    } finally {
+      if (stallTimer) { clearTimeout(stallTimer); }
     }
 
     const assembledText = textParts.join('').trim();
@@ -1341,6 +1392,8 @@ export async function runDeepReview(
       const result = parseDeepReviewResponse(text, profile, Date.now() - start, model.name || 'copilot');
       result.toolCallsUsed        = toolCallCount;
       result.estimatedInputTokens = Math.round(getConversationSize(messages) / 4);
+      // Model-accurate output token count (best-effort) for the cost estimate.
+      try { result.estimatedOutputTokens = await model.countTokens(text); } catch { /* leave undefined */ }
       result.sources              = sources;
       log(`DONE  reason=final-answer  toolCalls=${toolCallCount}  verdict=${result.verdict}  score=${result.score}  comments=${result.comments.length}  duration=${Date.now() - start}ms`);
       return result;

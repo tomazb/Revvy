@@ -310,6 +310,12 @@ export interface ReviewResult {
   // PERF — token estimation for diagnostics
   estimatedInputTokens?: number;
   estimatedOutputTokens?: number;
+  /**
+   * When true, the reviewed diff does not reflect the local working tree (e.g.
+   * a combined multi-branch local review). The panel renders code snippets from
+   * the diff context attached to each comment rather than reading disk.
+   */
+  renderFromDiff?: boolean;
   /** Deep Review only: number of workspace tool calls executed in the agent loop. */
   toolCallsUsed?: number;
 }
@@ -550,12 +556,55 @@ async function buildRepoContext(
 // Prompt builders
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Tests JSON-schema fragment and the (large) test-generation instruction block.
+// Shared between buildSystemPrompt (when tests are requested inline) and the
+// standalone generateTests() call used by the per-file fan-out path, so the two
+// stay byte-identical. Keeping these out of the per-file system prompt is the
+// core of the "tests-once" optimization: the ~600-token block below is otherwise
+// re-sent on every one of N parallel file reviews.
+const TESTS_SCHEMA_FRAGMENT = `,"tests":[{"title":"<Feature area — failure mode in plain English>","category":"functional|security|boundary|performance","steps":["<imperative action>","<imperative action>","<imperative verification with exact expected result>"]}]`;
+
+const TEST_INSTRUCTIONS = `- "tests": Generate system-level tests that any team member (developer, manager, QA) can read and execute. Each test MUST have a "category" field.
+  ## Categories (include at least one from each category that applies):
+  • "functional" — basic feature correctness, happy-path workflows, expected behavior under normal conditions.
+  • "security" — data leakage, unauthorized access, unintended side effects on other data regions, lock leaks that block the system.
+  • "boundary" — first/last element behavior, empty inputs, maximum sizes, state after partial failure, and verifying that only the intended data region is modified while all adjacent regions remain untouched.
+  • "performance" — time impact of the change on real workflows, resource consumption, system responsiveness during the operation.
+  ## Step format — OBSERVABLE ACTIONS ONLY:
+  • Write steps as real-world actions a tester performs on the actual system. Think: what would a person physically do to verify this change works?
+  • Steps must describe the WORKFLOW that triggers the behavior, NOT the code path itself.
+  • CORRECT examples:
+    - "Perform the main user workflow end-to-end and verify the expected output appears"
+    - "Submit a request with the largest valid input size and verify the system handles it without error"
+    - "Perform the operation under normal load and record the total time taken end-to-end"
+    - "Attempt the same action with expired or missing credentials and verify the system rejects the request"
+    - "Verify that only the intended data region is cleared and all adjacent data remains completely unchanged"
+    - "Perform the same end-to-end workflow on every other product or service that uses this shared component and verify identical results"
+  • WRONG examples (NEVER write steps like these):
+    - "Set an internal feature flag to enabled and mock the lower-level handler to return failure" ← implementation detail, not a real-world action
+    - "Verify the internal retry counter is exactly 3 after a timeout" ← internal diagnostic, not observable by a user
+    - "Enable the fast-path mode using the raw configuration constant name" ← internal flag name, meaningless outside the codebase
+    - "Call the processing function directly and assert the return code is success" ← code-level, not a workflow test
+  • FORBIDDEN in every step: any name, identifier, or abbreviation visible in the source code — functions, variables, constants, opcodes, register names, command codes, component abbreviations, protocol fields. If a word exists in the diff, it cannot appear in a step.
+  • NO hedge words (try, consider, maybe). Direct imperative commands only.
+  • REQUIRED when the changed component is shared across projects: add a dedicated "functional" test that verifies the same observable behavior holds for every other consumer. If consumers cannot be determined from the diff, flag it explicitly as a test that must be run.
+  ## Rules:
+  • Every test must be understandable by a manager reading the review report.
+  • Focus on OBSERVABLE SYSTEM BEHAVIOR: what the user/tester sees, what data changes, how long it takes, what error appears.
+  • Title format: "<Feature area> — <what could go wrong in plain English>".
+  • Omit entirely if the diff is purely cosmetic (whitespace, comments, renames with no logic change).
+  • Max 6 scenarios total, up to 2 per category. Fewer sharp tests beat many shallow ones.`;
+
 function buildSystemPrompt(
   profile: ReviewProfile,
   sources?: ReviewSource[],
   repoContext?: string,
-  commitRules?: ReviewRule[]
+  commitRules?: ReviewRule[],
+  options?: { includeTests?: boolean }
 ): string {
+  // Tests are included inline by default. The parallel per-file path sets this
+  // false and generates tests once for the whole changeset via generateTests().
+  const includeTests = options?.includeTests ?? true;
   const enabledRules = profile.rules.filter(r => r.enabled);
 
   // PERF — compress rules into a compact table instead of verbose multi-line blocks.
@@ -626,7 +675,7 @@ ID | Severity | Title | Description
 ${rulesTable}
 
 ## Response Format (JSON only, no markdown fences)
-{"verdict":"APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION","score":1-10,"summary":"<overview>","comments":[{"file":"<file>","line":<N>,"endLine":<N>,"severity":"error|warning|suggestion","ruleId":"<ID>","ruleTitle":"<title>","message":"<120 chars>","suggestion":"<raw code, \\n joined>","codeFragment":"<verbatim 1-3 lines from diff>"}],"conclusion":"<summary>","tests":[{"title":"<Feature area — failure mode in plain English>","category":"functional|security|boundary|performance","steps":["<imperative action>","<imperative action>","<imperative verification with exact expected result>"]}]${commitMsgSchema}}
+{"verdict":"APPROVE|REQUEST_CHANGES|NEEDS_DISCUSSION","score":1-10,"summary":"<overview>","comments":[{"file":"<file>","line":<N>,"endLine":<N>,"severity":"error|warning|suggestion","ruleId":"<ID>","ruleTitle":"<title>","message":"<120 chars>","suggestion":"<raw code, \\n joined>","codeFragment":"<verbatim 1-3 lines from diff>"}],"conclusion":"<summary>"${includeTests ? TESTS_SCHEMA_FRAGMENT : ''}${commitMsgSchema}}
 
 ## Rules
 - "message": single sentence <120 chars, no explanations
@@ -636,37 +685,7 @@ ${rulesTable}
 - Score harshly: 7-8=acceptable, 5-6=needs work, 3-4=significant issues, 1-2=major problems
 - No praise, focus on problems only
 - Reference rule ID in every comment
-- "tests": Generate system-level tests that any team member (developer, manager, QA) can read and execute. Each test MUST have a "category" field.
-  ## Categories (include at least one from each category that applies):
-  • "functional" — basic feature correctness, happy-path workflows, expected behavior under normal conditions.
-  • "security" — data leakage, unauthorized access, unintended side effects on other data regions, lock leaks that block the system.
-  • "boundary" — first/last element behavior, empty inputs, maximum sizes, state after partial failure, and verifying that only the intended data region is modified while all adjacent regions remain untouched.
-  • "performance" — time impact of the change on real workflows, resource consumption, system responsiveness during the operation.
-  ## Step format — OBSERVABLE ACTIONS ONLY:
-  • Write steps as real-world actions a tester performs on the actual system. Think: what would a person physically do to verify this change works?
-  • Steps must describe the WORKFLOW that triggers the behavior, NOT the code path itself.
-  • CORRECT examples:
-    - "Perform the main user workflow end-to-end and verify the expected output appears"
-    - "Submit a request with the largest valid input size and verify the system handles it without error"
-    - "Perform the operation under normal load and record the total time taken end-to-end"
-    - "Attempt the same action with expired or missing credentials and verify the system rejects the request"
-    - "Verify that only the intended data region is cleared and all adjacent data remains completely unchanged"
-    - "Perform the same end-to-end workflow on every other product or service that uses this shared component and verify identical results"
-  • WRONG examples (NEVER write steps like these):
-    - "Set an internal feature flag to enabled and mock the lower-level handler to return failure" ← implementation detail, not a real-world action
-    - "Verify the internal retry counter is exactly 3 after a timeout" ← internal diagnostic, not observable by a user
-    - "Enable the fast-path mode using the raw configuration constant name" ← internal flag name, meaningless outside the codebase
-    - "Call the processing function directly and assert the return code is success" ← code-level, not a workflow test
-  • FORBIDDEN in every step: any name, identifier, or abbreviation visible in the source code — functions, variables, constants, opcodes, register names, command codes, component abbreviations, protocol fields. If a word exists in the diff, it cannot appear in a step.
-  • NO hedge words (try, consider, maybe). Direct imperative commands only.
-  • REQUIRED when the changed component is shared across projects: add a dedicated "functional" test that verifies the same observable behavior holds for every other consumer. If consumers cannot be determined from the diff, flag it explicitly as a test that must be run.
-  ## Rules:
-  • Every test must be understandable by a manager reading the review report.
-  • Focus on OBSERVABLE SYSTEM BEHAVIOR: what the user/tester sees, what data changes, how long it takes, what error appears.
-  • Title format: "<Feature area> — <what could go wrong in plain English>".
-  • Omit entirely if the diff is purely cosmetic (whitespace, comments, renames with no logic change).
-  • Max 6 scenarios total, up to 2 per category. Fewer sharp tests beat many shallow ones.
-${ticketSection}${multiRepoSection}${repoContextSection ? '\n' + repoContextSection : ''}${commitMsgSection}`;
+${includeTests ? TEST_INSTRUCTIONS + '\n' : ''}${ticketSection}${multiRepoSection}${repoContextSection ? '\n' + repoContextSection : ''}${commitMsgSection}`;
 }
 
 function buildUserPrompt(diff: string, options?: { allInOne?: boolean }): string {
@@ -890,6 +909,10 @@ function parseReviewResponse(
     modelUsed: aiResp.model,
     backendUsed: aiResp.backend,
     durationMs,
+    // Model-accurate counts when the backend reports them (Copilot via
+    // countTokens); undefined otherwise so callers fall back to chars/4.
+    estimatedInputTokens: aiResp.inputTokens,
+    estimatedOutputTokens: aiResp.outputTokens,
   };
 }
 
@@ -970,13 +993,19 @@ function averageScore(scores: number[]): number {
  *   - The merged review summary (already generated)
  *   - Commit-style rules
  */
+interface AuxCallResult<T> {
+  value: T;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
 async function generateCommitMessages(
   changedFiles: string[],
   symbols: string[],
   reviewSummary: string,
   commitRules: ReviewRule[],
   keys: AIKeys
-): Promise<string[]> {
+): Promise<AuxCallResult<string[]>> {
   const ruleLines = commitRules.map(r => {
     const sug = r.suggestion ? ` → ${r.suggestion}` : '';
     return `- [${r.id}] ${r.title}: ${r.description}${sug}`;
@@ -999,18 +1028,70 @@ async function generateCommitMessages(
 
   try {
     const aiResp = await callAI(userPrompt, systemPrompt, keys);
+    const tokens = { inputTokens: aiResp.inputTokens, outputTokens: aiResp.outputTokens };
     const clean = aiResp.text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
     const jsonMatch = clean.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) { return []; }
+    if (!jsonMatch) { return { value: [], ...tokens }; }
     const parsed = JSON.parse(jsonMatch[0]);
-    return Array.isArray(parsed.commit_messages)
+    const messages = Array.isArray(parsed.commit_messages)
       ? parsed.commit_messages
           .filter((m: any) => typeof m === 'string' && m.trim().length > 0)
           .slice(0, 5)
       : [];
+    return { value: messages, ...tokens };
   } catch (e: any) {
     console.log(`[Revvy] generateCommitMessages failed: ${e.message}`);
-    return [];
+    return { value: [] };
+  }
+}
+
+/**
+ * Dedicated AI call to generate the integration-test suggestions once for the
+ * whole changeset, used by the parallel per-file fan-out path.
+ *
+ * "Tests-once" optimization: instead of asking every per-file review to emit
+ * tests (which re-sends the large test-generation instruction block on each of
+ * N calls and produces N redundant test arrays that are then deduped), the
+ * per-file prompts omit tests entirely and this single call generates them with
+ * full changeset context — fewer input tokens, fewer output tokens, and better
+ * tests because the model sees the whole diff at once.
+ */
+async function generateTests(
+  diff: string,
+  profile: ReviewProfile,
+  keys: AIKeys,
+): Promise<AuxCallResult<ReviewTest[]>> {
+  const systemPrompt =
+    `You are a professional code reviewer specializing in ${profile.label}.` +
+    `${profile.system_prompt_extra ? '\n\n' + profile.system_prompt_extra.trim() : ''}\n\n` +
+    `Generate integration tests for the following multi-file diff.\n` +
+    `Return ONLY valid JSON: {"tests":[{"title":"<Feature area — failure mode in plain English>","category":"functional|security|boundary|performance","steps":["<imperative action>","<imperative action>","<imperative verification with exact expected result>"]}]}\n\n` +
+    `## Test Generation Rules\n${TEST_INSTRUCTIONS}`;
+
+  const userPrompt =
+    `Generate the integration tests for this diff. Review ONLY lines starting with + or -.\n\n` +
+    `\`\`\`diff\n${diff}\n\`\`\`\n\n` +
+    `Return only the JSON object with the "tests" array.`;
+
+  try {
+    const aiResp = await callAI(userPrompt, systemPrompt, keys);
+    const tokens = { inputTokens: aiResp.inputTokens, outputTokens: aiResp.outputTokens };
+    const clean = aiResp.text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = clean.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) { return { value: [], ...tokens }; }
+    const parsed = JSON.parse(jsonMatch[0]);
+    const tests: ReviewTest[] = Array.isArray(parsed.tests)
+      ? parsed.tests.map((t: any): ReviewTest => ({
+          title: t.title || 'Untitled Test',
+          category: (['functional', 'security', 'boundary', 'performance'].includes(t.category)
+            ? t.category : 'functional') as ReviewTest['category'],
+          steps: Array.isArray(t.steps) ? t.steps.map((s: any) => String(s)) : [],
+        }))
+      : [];
+    return { value: sortTestsByCategory(tests), ...tokens };
+  } catch (e: any) {
+    console.log(`[Revvy] generateTests failed: ${e.message}`);
+    return { value: [] };
   }
 }
 
@@ -1021,7 +1102,13 @@ export async function runReview(
   keys: AIKeys = {},
   onChunk?: StreamChunkCallback,
   commitRules?: ReviewRule[],
-  mode: 'per_file' | 'all_in_one' = 'per_file'
+  mode: 'per_file' | 'all_in_one' = 'per_file',
+  // When true, the diff does not reflect the current working tree (e.g. a
+  // combined multi-branch local review of branches that aren't checked out).
+  // Code context is then sourced from the diff itself rather than disk, the
+  // disk-based cross-file search is skipped, and commit messages are not
+  // generated. The panel renders snippets from the diff via result.renderFromDiff.
+  contextFromDiff = false
 ): Promise<ReviewResult> {
   if (!diff.trim()) {
     throw new Error('No diff to review');
@@ -1049,6 +1136,13 @@ export async function runReview(
   // Shared by both parallel and single-file paths below.
   const isRemote = !!(sources && sources.length > 0 && sources[0].type !== 'local');
 
+  // useDiffContext = the diff doesn't match the working tree, so code context
+  // must come from the diff (not disk) and the disk cross-file search/commit
+  // messages are skipped. True for remote MRs and for multi-branch local
+  // reviews (contextFromDiff). Used everywhere the old code keyed on isRemote
+  // to decide "don't touch the local workspace".
+  const useDiffContext = isRemote || contextFromDiff;
+
   // FIX 2 — enable per-file fan-out for multi-MR reviews.
   // Previously gated off with `!isMultiRepo`, forcing the entire combined diff
   // through a single monolithic AI call regardless of how many files it contained.
@@ -1071,13 +1165,15 @@ export async function runReview(
     // PERF-2: Build system prompt ONCE (cached base without repo context).
     // For multi-repo reviews, sources[] is included here so every per-file
     // prompt carries the cross-repo integration context.
-    const systemPromptBase = buildSystemPrompt(profile, sources, '');
+    // Tests-once: omit the test-generation block from per-file prompts — tests
+    // are generated in a single consolidated call after the fan-out.
+    const systemPromptBase = buildSystemPrompt(profile, sources, '', undefined, { includeTests: false });
 
     let sharedFileCache: Map<string, string> = new Map();
-    if (!isRemote) {
+    if (!useDiffContext) {
       // FIX 3: Pre-build shared workspace file cache ONCE before fan-out.
       // All parallel reviewSingleFile() calls share this map — zero duplicate reads.
-      // Only for local reviews where the workspace IS the diff source.
+      // Only when the workspace IS the diff source (local review of current HEAD).
       const globPattern = profile.file_patterns.find(p => p !== '**/*') ?? profile.file_patterns[0] ?? '**/*';
       try {
         const wsFiles = await vscode.workspace.findFiles(globPattern, '{**/node_modules/**,**/out/**,**/dist/**,**/build/**}', 50);
@@ -1089,10 +1185,11 @@ export async function runReview(
     const perFileResults = await Promise.all(
       fileSections.map(({ filePath, diff: fd, isNewFile }) =>
         withConcurrencyLimit(async () => {
-          const result = await reviewSingleFile(filePath, fd, profile, keys, { systemPromptBase, userPrompt: '' }, onChunk, sharedFileCache, isNewFile, isRemote);
-          // For remote reviews, attach diff-sourced code context to every comment
-          // so the panel can render code without reading local workspace files.
-          if (isRemote) { attachDiffContext(result.comments, fd); }
+          const result = await reviewSingleFile(filePath, fd, profile, keys, { systemPromptBase, userPrompt: '' }, onChunk, sharedFileCache, isNewFile, useDiffContext);
+          // When the diff isn't the working tree, attach diff-sourced code
+          // context to every comment so the panel renders code without reading
+          // (mismatched) local workspace files.
+          if (useDiffContext) { attachDiffContext(result.comments, fd); }
           return result;
         })
       )
@@ -1101,7 +1198,6 @@ export async function runReview(
     const durationMs = Date.now() - start;
 
     const allComments = perFileResults.flatMap(r => r.comments);
-    const allTests    = perFileResults.flatMap(r => r.tests);
 
     // Dedupe: same file + line + ruleId = same issue. Fall back to message
     // when ruleId is missing (older profile responses may omit it).
@@ -1113,18 +1209,7 @@ export async function runReview(
       return true;
     });
 
-    const seenTestTitles = new Set<string>();
-    const uniqueTests = allTests.filter(t => {
-      if (seenTestTitles.has(t.title)) { return false; }
-      seenTestTitles.add(t.title);
-      return true;
-    });
-
     const lastResult = perFileResults[perFileResults.length - 1];
-
-    // PERF: estimate tokens
-    const totalInputChars = systemPromptBase.length + filteredDiff.length;
-    const totalOutputChars = perFileResults.reduce((sum, r) => sum + r.summary.length + r.conclusion.length + r.comments.reduce((cs, c) => cs + c.message.length + (c.suggestion?.length || 0), 0), 0);
 
     merged = {
       verdict:     mergeVerdicts(perFileResults.map(r => r.verdict)),
@@ -1132,11 +1217,10 @@ export async function runReview(
       summary:     perFileResults.map(r => r.summary).filter(Boolean).join(' '),
       comments:    uniqueComments,
       conclusion:  perFileResults.map(r => r.conclusion).filter(Boolean).join(' '),
-      tests:       sortTestsByCategory(uniqueTests),
-      // Commit messages are NOT generated per-file (each file only sees its own
-      // diff, producing file-scoped messages). Instead, generateCommitMessages()
-      // is called once below with full changeset context.  Remote reviews skip
-      // this entirely — commitMessages stays empty.
+      // Tests-once: per-file reviews no longer emit tests (the large
+      // test-generation block is omitted from their system prompt). Tests are
+      // produced by a single dedicated call below with full changeset context.
+      tests:       [],
       commitMessages: [],
       sources,
       profileUsed: profile.label,
@@ -1149,26 +1233,48 @@ export async function runReview(
         skippedFilePaths:    filterResult.skippedFilePaths,
         estimatedTokensSaved: filterResult.estimatedTokensSaved,
       },
-      estimatedInputTokens:  estimateTokens(totalInputChars),
-      estimatedOutputTokens: estimateTokens(totalOutputChars),
     };
 
-    // One lightweight extra AI call to generate commit messages for the full
-    // changeset. Only for local reviews when commitRules are provided.
-    if (!isRemote && commitRules && commitRules.length > 0) {
-      const changedFiles = fileSections.map(s => s.filePath);
-      const allSymbols = fileSections.flatMap(s => extractChangedSymbols(s.diff));
-      const uniqueSymbols = [...new Set(allSymbols)];
-      merged.commitMessages = await generateCommitMessages(
-        changedFiles, uniqueSymbols, merged.summary, commitRules, keys
-      );
+    // Two lightweight extra AI calls, run in parallel:
+    //   • generateTests — tests-once for the whole changeset (local + remote).
+    //   • generateCommitMessages — local reviews only, when commitRules exist
+    //     (each per-file diff only sees itself, so commit messages must be
+    //     generated once with full changeset context).
+    const changedFiles  = fileSections.map(s => s.filePath);
+    const uniqueSymbols = [...new Set(fileSections.flatMap(s => extractChangedSymbols(s.diff)))];
+    const wantCommit = !useDiffContext && !!commitRules && commitRules.length > 0;
+
+    const [testsRes, commitRes] = await Promise.all([
+      generateTests(filteredDiff, profile, keys),
+      wantCommit
+        ? generateCommitMessages(changedFiles, uniqueSymbols, merged.summary, commitRules!, keys)
+        : Promise.resolve<AuxCallResult<string[]>>({ value: [] }),
+    ]);
+    merged.tests          = testsRes.value;
+    merged.commitMessages = commitRes.value;
+
+    // Token accounting: prefer model-accurate per-call counts (Copilot reports
+    // them via countTokens); fall back to a chars/4 estimate when unavailable.
+    // Auxiliary test/commit calls are folded into the totals.
+    const haveAccurate = perFileResults.some(r => r.estimatedInputTokens !== undefined);
+    if (haveAccurate) {
+      const sumIn  = perFileResults.reduce((s, r) => s + (r.estimatedInputTokens  ?? 0), 0);
+      const sumOut = perFileResults.reduce((s, r) => s + (r.estimatedOutputTokens ?? 0), 0);
+      merged.estimatedInputTokens  = sumIn  + (testsRes.inputTokens  ?? 0) + (commitRes.inputTokens  ?? 0);
+      merged.estimatedOutputTokens = sumOut + (testsRes.outputTokens ?? 0) + (commitRes.outputTokens ?? 0);
+    } else {
+      const totalInputChars  = systemPromptBase.length + filteredDiff.length;
+      const totalOutputChars = perFileResults.reduce((sum, r) => sum + r.summary.length + r.conclusion.length + r.comments.reduce((cs, c) => cs + c.message.length + (c.suggestion?.length || 0), 0), 0);
+      merged.estimatedInputTokens  = estimateTokens(totalInputChars);
+      merged.estimatedOutputTokens = estimateTokens(totalOutputChars);
     }
   } else {
     const systemPrompt = buildSystemPrompt(
       profile, sources, undefined,
-      // Pass commitRules only for local reviews (single-file or all-in-one) so the
-      // AI generates commit messages in the same call — zero extra round-trip cost.
-      !isRemote ? commitRules : undefined
+      // Pass commitRules only for working-tree local reviews so the AI generates
+      // commit messages in the same call — zero extra round-trip cost. Skipped
+      // for remote MRs and multi-branch reviews (no single commit context).
+      !useDiffContext ? commitRules : undefined
     );
     // Use the multi-file all-in-one prompt when mode is 'all_in_one' and the diff
     // spans more than one file — instructs the AI to attribute findings by file path.
@@ -1182,11 +1288,11 @@ export async function runReview(
     const durationMs = Date.now() - start;
 
     merged = parseReviewResponse(aiResp.text, profile, aiResp, durationMs, sources);
-    // For remote reviews, attach diff-sourced code context.
+    // When the diff isn't the working tree, attach diff-sourced code context.
     // Use per-file diff matching so each comment gets its own file's diff.
-    if (isRemote) {
+    if (useDiffContext) {
       attachDiffContextByFile(merged.comments, fileSections);
-      // Hard guard: never expose commit messages in remote reviews.
+      // Hard guard: never expose commit messages for remote/multi-branch diffs.
       merged.commitMessages = [];
     }
     merged.filterStats = {
@@ -1195,9 +1301,15 @@ export async function runReview(
       skippedFilePaths:    filterResult.skippedFilePaths,
       estimatedTokensSaved: filterResult.estimatedTokensSaved,
     };
-    merged.estimatedInputTokens  = estimateTokens(systemPrompt + userPrompt);
-    merged.estimatedOutputTokens = estimateTokens(aiResp.text);
+    // Prefer model-accurate counts (Copilot via countTokens); fall back to chars/4.
+    merged.estimatedInputTokens  = aiResp.inputTokens  ?? estimateTokens(systemPrompt + userPrompt);
+    merged.estimatedOutputTokens = aiResp.outputTokens ?? estimateTokens(aiResp.text);
   }
+
+  // Signal to the panel that snippets should be rendered from the diff, not the
+  // working tree, for multi-branch local reviews. (Remote reviews already drive
+  // this via sources[].) Set only for the local off-tree case.
+  if (contextFromDiff) { merged.renderFromDiff = true; }
 
   return merged;
 }

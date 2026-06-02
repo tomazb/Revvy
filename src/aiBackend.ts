@@ -49,6 +49,13 @@ export interface AIResponse {
   text: string;
   model: string;
   backend: string;
+  /**
+   * Model-accurate token counts, populated only on the Copilot path via
+   * vscode.lm `model.countTokens()`. Undefined for backends that don't report
+   * usage — callers fall back to a chars/4 estimate in that case.
+   */
+  inputTokens?: number;
+  outputTokens?: number;
 }
 
 export interface AIKeys {
@@ -79,9 +86,16 @@ async function callCopilot(
       ? (allModels.find((m: any) => m.id === selectedModelId) ?? allModels[0])
       : allModels[0];
 
+    const combinedInput = systemPrompt + '\n\n' + prompt;
     const messages = [
-      (vscode.LanguageModelChatMessage as any).User(systemPrompt + '\n\n' + prompt),
+      (vscode.LanguageModelChatMessage as any).User(combinedInput),
     ];
+
+    // Model-accurate input token count (best-effort). countTokens uses the
+    // model's real tokenizer — far more precise than chars/4 — and feeds the
+    // AI-credit estimate shown in the panel. Never let it break a review.
+    let inputTokens: number | undefined;
+    try { inputTokens = await model.countTokens(combinedInput); } catch { /* leave undefined */ }
 
     const cts = new vscode.CancellationTokenSource();
     const response = await model.sendRequest(messages, {}, cts.token);
@@ -110,7 +124,10 @@ async function callCopilot(
       throw new Error('Copilot returned an empty response. The prompt may be too large or the model is unavailable.');
     }
 
-    return { text: fullText, model: model.name || 'copilot', backend: 'GitHub Copilot' };
+    let outputTokens: number | undefined;
+    try { outputTokens = await model.countTokens(fullText); } catch { /* leave undefined */ }
+
+    return { text: fullText, model: model.name || 'copilot', backend: 'GitHub Copilot', inputTokens, outputTokens };
   } catch (error: any) {
     if (error.message?.includes('cancelled') || error.name === 'Canceled') {
       throw new Error('Copilot stream timed out after 120s of inactivity. The model may be overloaded — try again or switch backends.');

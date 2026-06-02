@@ -92,7 +92,7 @@
       },
       {
         "command": "revvy.setTicketRequirements",
-        "title": "Set Requirements (Optional)",
+        "title": "Set Requirements (Jira)",
         "icon": "$(checklist)"
       },
       {
@@ -241,6 +241,21 @@
           "type": "boolean",
           "default": false,
           "description": "Skip TLS certificate verification for proxy-bypassed hosts. Enable if the server uses a self-signed or corporate CA certificate and you get CERT errors."
+        },
+        "revvy.cost.inputCreditsPerMillionTokens": {
+          "type": "number",
+          "default": 300,
+          "description": "GitHub AI credits charged per 1,000,000 input tokens, used for the estimated-cost footer (1 credit = $0.01). Default ≈ $3/1M. Set this to match your selected model's input rate on GitHub's Models & pricing page."
+        },
+        "revvy.cost.outputCreditsPerMillionTokens": {
+          "type": "number",
+          "default": 1500,
+          "description": "GitHub AI credits charged per 1,000,000 output tokens, used for the estimated-cost footer (1 credit = $0.01). Default ≈ $15/1M. Set this to match your selected model's output rate on GitHub's Models & pricing page."
+        },
+        "revvy.deepReview.streamStallTimeoutMs": {
+          "type": "number",
+          "default": 600000,
+          "description": "Deep Review: cancel a round if the model produces no stream activity within this many milliseconds (default 600000 = 10 min). Prevents the agent loop from hanging indefinitely on a slow or stalled Copilot response."
         }
       }
     },

@@ -35,6 +35,26 @@ export class ReviewPanelProvider implements vscode.WebviewViewProvider {
         case 'reviewMultiMR':
           vscode.commands.executeCommand('revvy.reviewMultiMR');
           break;
+        case 'requestFolders': {
+          try {
+            const folders = (await vscode.commands.executeCommand<Array<{ path: string; name: string; depth: number }>>('revvy.listGitFolders')) ?? [];
+            webviewView.webview.postMessage({ type: 'folders', folders });
+          } catch (e: any) {
+            webviewView.webview.postMessage({
+              type: 'folders',
+              folders: [],
+              error: e?.message ?? String(e),
+            });
+          }
+          break;
+        }
+        case 'reviewFolders': {
+          const folders: string[] = Array.isArray(msg.folders) ? msg.folders : [];
+          if (folders.length > 0) {
+            vscode.commands.executeCommand('revvy.reviewSelectedFolders', folders);
+          }
+          break;
+        }
         case 'changeModel':
           await vscode.workspace.getConfiguration('revvy')
             .update('selectedModelId', msg.modelId, vscode.ConfigurationTarget.Global);
@@ -1038,8 +1058,6 @@ body {
     const profile = vscode.workspace.getConfiguration('revvy').get<string>('activeProfile', 'c-embedded');
     const revvyCfg       = vscode.workspace.getConfiguration('revvy');
     const maxAgentRounds = revvyCfg.get<number>('deepReview.maxAgentRounds', 30);
-    const maxToolCalls   = revvyCfg.get<number>('deepReview.maxToolCalls', 50);
-    const maxConvChars   = revvyCfg.get<number>('deepReview.maxConversationChars', 200_000);
     const logoPngUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'resources', 'home_icon.png')
     ).toString();
@@ -1165,53 +1183,6 @@ body {
           <svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4"/><path d="M6 20v-2a6 6 0 0 1 12 0v2"/></svg>
           Profile: <span>${this.escapeHtml(profile)}</span>
         </div>
-        <button class="btn-primary" onclick="vscode.postMessage({type:'runReview'})">
-          Review Current Diff
-        </button>
-      </div>
-
-      <!-- Review depth selector (Quick / Deep) -->
-      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
-        <div class="model-section-label">
-          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
-          Review depth
-        </div>
-        <div class="filter-group">
-          <button id="scope-quick" class="filter-chip active">Quick</button>
-          <button id="scope-deep" class="filter-chip">Deep</button>
-        </div>
-        <div id="deep-review-limits" style="margin:10px 0 0;display:none;flex-direction:column;gap:7px">
-          <div style="display:flex;align-items:center;gap:8px">
-            <input id="deep-max-agent-rounds" type="number" min="1" step="1" value="${maxAgentRounds}"
-              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
-            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">Agent rounds</label>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <input id="deep-max-tool-calls" type="number" min="1" step="1" value="${maxToolCalls}"
-              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
-            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">Tool calls</label>
-          </div>
-          <div style="display:flex;align-items:center;gap:8px">
-            <input id="deep-max-conv-chars" type="number" min="10000" step="10000" value="${maxConvChars}"
-              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
-            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">History (chars)</label>
-          </div>
-        </div>
-        <p id="deep-disclaimer" hidden style="margin:6px 0 0;font-size:10px;color:var(--fg-subtle);line-height:1.4">
-          Requires GitHub Copilot. For local diffs reads workspace files; for remote PR/MR reviews reads files directly from the repository at the PR head commit.
-        </p>
-      </div>
-
-      <!-- Review mode selector -->
-      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
-        <div class="model-section-label">
-          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="1"/><rect x="2" y="14" width="10" height="7" rx="1"/><rect x="16" y="14" width="6" height="7" rx="1"/></svg>
-          Review mode
-        </div>
-        <div class="filter-group">
-          <button id="mode-per-file" class="filter-chip active">Per file</button>
-          <button id="mode-all-in-one" class="filter-chip">All in one</button>
-        </div>
       </div>
 
       <!-- Secondary actions -->
@@ -1236,20 +1207,52 @@ body {
         ` : `
         <button class="btn-secondary" onclick="vscode.postMessage({type:'setTicket'})">
           ${this.icons.clipboard}<span>Set Requirements</span>
-          <span class="label-right">optional</span>
+          <span class="label-right">Jira</span>
         </button>
         `}
         <button class="btn-secondary" onclick="vscode.postMessage({type:'reviewMultiMR'})">
           ${this.icons.repoForked}<span>Review Remote MRs</span>
+          <span class="label-right">Gitlab/GitHub</span>
         </button>
         <button class="btn-secondary" onclick="vscode.postMessage({type:'openConfigure'})" style="margin-top:4px;border-color:var(--border-default)">
           ${this.icons.settings}<span>Configuration</span>
-          <span class="label-right">integrations</span>
+          <span class="label-right">Integrations</span>
         </button>
       </div>
 
+      <!-- Review depth selector (Quick / Deep) -->
+      <div class="model-section" style="border-top:1px solid var(--border-muted);border-bottom:1px solid var(--border-muted)">
+        <div class="model-section-label">
+          <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+          Review depth
+        </div>
+        <div class="filter-group">
+          <button id="scope-quick" class="filter-chip active">Quick</button>
+          <button id="scope-deep" class="filter-chip">Deep</button>
+        </div>
+        <div id="deep-review-limits" style="margin:10px 0 0;display:none;flex-direction:column;gap:7px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <input id="deep-max-agent-rounds" type="number" min="1" step="1" value="${maxAgentRounds}"
+              style="width:58px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,var(--border-default));border-radius:4px;padding:3px 6px;font-size:11px" />
+            <label style="font-size:10px;color:var(--fg-subtle);white-space:nowrap">Agent rounds</label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Review mode selector -->
+      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
+        <div class="model-section-label">
+          <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="1"/><rect x="2" y="14" width="10" height="7" rx="1"/><rect x="16" y="14" width="6" height="7" rx="1"/></svg>
+          Review mode
+        </div>
+        <div class="filter-group">
+          <button id="mode-per-file" class="filter-chip active">Per file</button>
+          <button id="mode-all-in-one" class="filter-chip">All in one</button>
+        </div>
+      </div>
+
       <!-- Model selector -->
-      <div class="model-section">
+      <div class="model-section" style="border-bottom:1px solid var(--border-muted)">
         <div class="model-section-label">
           <svg viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>
           Copilot Model
@@ -1261,14 +1264,120 @@ body {
           </select>
         </div>
       </div>
+
+      <!-- Component-folder review (offline; each folder's local changes vs HEAD) -->
+      <div class="model-section">
+        <div class="model-section-label">
+          ${this.icons.repoForked}
+          Project folders
+        </div>
+        <button class="btn-secondary" id="folderLoadBtn" onclick="loadFolders()">
+          ${this.icons.folderOpen}<span>Choose folders to review…</span>
+        </button>
+        <div id="folderList" style="display:none;margin-top:8px;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto"></div>
+      </div>
+
+      <!-- Primary action: review selected folders if any are ticked, else the current diff -->
+      <div style="padding:16px 20px;border-top:1px solid var(--border-muted)">
+        <button class="btn-primary" onclick="runReviewAction()">
+          Review
+        </button>
+      </div>
     </div>
-    <p style="padding:12px 20px 16px;font-size:10px;color:var(--fg-subtle);margin:0;line-height:1.5">&#9432; &ldquo;All in one&rdquo; works best when the MR is small in both dimensions: fewer than ~5 files and under ~300 lines of diff. Use &ldquo;Per file&rdquo; otherwise.</p>
+    <p style="padding:12px 20px 4px;font-size:10px;color:var(--fg-subtle);margin:0;line-height:1.5">&#9432; &ldquo;All in one&rdquo; works best when the MR is small in both dimensions: fewer than ~5 files and under ~300 lines of diff. Use &ldquo;Per file&rdquo; otherwise.</p>
+    <p style="padding:0 20px 16px;font-size:10px;color:var(--fg-subtle);margin:0;line-height:1.5">&#9432; &ldquo;Deep&rdquo; lets Copilot explore related files with tools before reviewing — more thorough on complex or high-risk changes, but slower and uses more AI credits than &ldquo;Quick&rdquo;.</p>
   </div>
 
   <script>
     const vscode = acquireVsCodeApi();
+
+    function escHtml(s) {
+      return String(s).replace(/[&<>"']/g, function(c) {
+        return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#039;' }[c];
+      });
+    }
+
+    // Toggle the folder list open/closed. Re-opening reuses the already-loaded
+    // list (preserving ticked boxes); the first open fetches it.
+    function loadFolders() {
+      const list = document.getElementById('folderList');
+      if (!list) { return; }
+      if (list.dataset.open === '1') {
+        list.style.display = 'none';
+        list.dataset.open = '0';
+        return;
+      }
+      list.dataset.open = '1';
+      list.style.display = 'flex';
+      if (list.dataset.loaded === '1') { return; } // reuse existing list + checks
+      list.innerHTML = '<div style="font-size:11px;color:var(--fg-subtle)">Loading folders…</div>';
+      vscode.postMessage({ type: 'requestFolders' });
+    }
+
+    // Single review action: review the ticked folders if any, else the current diff.
+    function runReviewAction() {
+      const checked = Array.prototype.slice.call(document.querySelectorAll('.folder-cb'))
+        .filter(function(c) { return c.checked; })
+        .map(function(c) { return c.value; });
+      if (checked.length > 0) {
+        vscode.postMessage({ type: 'reviewFolders', folders: checked });
+      } else {
+        vscode.postMessage({ type: 'runReview' });
+      }
+    }
+
     window.addEventListener('message', e => {
       const msg = e.data;
+      if (msg.type === 'folders') {
+        const list = document.getElementById('folderList');
+        if (!list) { return; }
+        if (msg.error) {
+          list.innerHTML = '<div style="font-size:11px;color:var(--sev-error)">Could not list folders: ' + escHtml(msg.error) + '</div>';
+          list.style.display = 'flex';
+          return;
+        }
+        if (!msg.folders || msg.folders.length === 0) {
+          list.innerHTML = '<div style="font-size:11px;color:var(--fg-subtle)">No git component folders found in this workspace.</div>';
+          list.style.display = 'flex';
+          return;
+        }
+        // Compute ├──/└── tree connectors from the flat, pre-order node list.
+        const nodes = msg.folders;
+        const count = nodes.length;
+        // isLast[i]: node i is the last child among its siblings (same depth,
+        // no later same-depth node before depth drops below it).
+        const isLast = [];
+        for (let i = 0; i < count; i++) {
+          const d = Number(nodes[i].depth) || 0;
+          let last = true;
+          for (let j = i + 1; j < count; j++) {
+            const dj = Number(nodes[j].depth) || 0;
+            if (dj < d) { break; }
+            if (dj === d) { last = false; break; }
+          }
+          isLast[i] = last;
+        }
+        // bar[k]: whether an ancestor at depth k still has following siblings
+        // (→ draw a vertical line at that level for descendants).
+        const bar = {};
+        list.innerHTML = nodes.map(function(node, i) {
+          const d = Number(node.depth) || 0;
+          bar[d] = !isLast[i];
+          let prefix = '';
+          for (let k = 1; k < d; k++) { prefix += bar[k] ? '│  ' : '   '; }
+          if (d >= 1) { prefix += isLast[i] ? '└─ ' : '├─ '; }
+          const v = escHtml(node.path);
+          const name = escHtml(node.name);
+          return '<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--fg-default);cursor:pointer;padding:2px 0">'
+            + (prefix ? '<span style="font-family:var(--font-mono);color:var(--fg-subtle);white-space:pre;flex-shrink:0">' + prefix + '</span>' : '')
+            + '<input type="checkbox" class="folder-cb" value="' + v + '" />'
+            + '<span style="font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + name + '/</span>'
+            + '</label>';
+        }).join('');
+        list.style.display = 'flex';
+        list.dataset.loaded = '1';
+        list.dataset.open = '1';
+      }
       if (msg.type === 'updateModels') {
         const sel = document.getElementById('modelSelect');
         if (!sel) return;
@@ -1347,8 +1456,6 @@ body {
         });
       }
       saveNumOnBlur('deep-max-agent-rounds', 'saveMaxAgentRounds');
-      saveNumOnBlur('deep-max-tool-calls',   'saveMaxToolCalls');
-      saveNumOnBlur('deep-max-conv-chars',   'saveMaxConvChars');
     })();
   </script>
 </body>
@@ -1684,9 +1791,18 @@ body {
     const profileShort = this.escapeHtml(r.profileUsed);
     const modelShort   = this.escapeHtml(r.modelUsed.split('/').pop() ?? r.modelUsed);
 
-    // Detect remote review (diff came from GitHub/GitLab MCP, not local git).
-    // Remote reviews: skip local file reads — files don't exist in the workspace.
-    const isRemote = !!(r.sources?.length && r.sources[0].type !== 'local');
+    // Cost footer: total tokens + estimated GitHub AI credits.
+    const totalTokens = (r.estimatedInputTokens ?? 0) + (r.estimatedOutputTokens ?? 0);
+    const credits     = this.estimateCredits(r);
+    const tokenFooter = totalTokens > 0 ? ` &middot; ~${totalTokens.toLocaleString()} tokens` : '';
+    const creditFooter = credits !== undefined
+      ? ` &middot; <span title="Estimated GitHub AI credit cost (1 credit = $0.01), from ~${(r.estimatedInputTokens ?? 0).toLocaleString()} input + ${(r.estimatedOutputTokens ?? 0).toLocaleString()} output tokens at the per-model rates in settings (revvy.cost.*). Authoritative usage is in your GitHub usage dashboard." style="cursor:help">≈ ${this.formatCredits(credits)} credits</span>`
+      : '';
+
+    // Render snippets from the diff (not disk) when the diff doesn't match the
+    // working tree: remote MRs, or combined multi-branch local reviews
+    // (renderFromDiff). In both cases local file reads would be wrong/missing.
+    const isRemote = !!(r.sources?.length && r.sources[0].type !== 'local') || !!r.renderFromDiff;
 
     // FIX 4 — pre-read all unique files in parallel before rendering.
     // Previously getFileLines() was called inside renderComment() which runs
@@ -2147,7 +2263,7 @@ body {
         ${this.icons.copyClipboard}<span>Copy MD</span>
       </button>
     </div>
-    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s${r.toolCallsUsed ? ` &middot; ${r.toolCallsUsed} tool calls` : ''}${r.estimatedInputTokens ? ` &middot; ~${r.estimatedInputTokens.toLocaleString()} tokens` : ''}</div>
+    <div class="meta-footer">${this.escapeHtml(r.backendUsed)} &middot; ${(r.durationMs / 1000).toFixed(1)}s${r.toolCallsUsed ? ` &middot; ${r.toolCallsUsed} tool calls` : ''}${tokenFooter}${creditFooter}</div>
       </div>
 
 <script>
@@ -2275,6 +2391,33 @@ body {
         </button>
         <div id="${bodyId}" hidden style="border-top:1px solid var(--border-default);padding:10px 12px">${msgItems}</div>
       </div>`;
+  }
+
+  /**
+   * Estimate the GitHub AI-credit cost of a review (1 credit = $0.01).
+   *
+   * GitHub bills per token at a per-model rate. Since those rates live on the
+   * GitHub "Models and pricing" page and shift over time, the conversion uses
+   * configurable credits-per-million-token rates (revvy.cost.*) with frontier-
+   * model defaults (~$3/1M in, ~$15/1M out). Returns undefined when no token
+   * counts are available. This is an estimate — the GitHub usage dashboard is
+   * the authoritative source of billed credits.
+   */
+  private estimateCredits(r: ReviewResult): number | undefined {
+    const inTok  = r.estimatedInputTokens;
+    const outTok = r.estimatedOutputTokens;
+    if (inTok === undefined && outTok === undefined) { return undefined; }
+    const cfg = vscode.workspace.getConfiguration('revvy.cost');
+    const inRate  = cfg.get<number>('inputCreditsPerMillionTokens', 300);
+    const outRate = cfg.get<number>('outputCreditsPerMillionTokens', 1500);
+    return ((inTok ?? 0) / 1_000_000) * inRate + ((outTok ?? 0) / 1_000_000) * outRate;
+  }
+
+  /** Format a credit estimate: 2 decimals under 1, 1 decimal under 10, else integer. */
+  private formatCredits(credits: number): string {
+    if (credits < 1)  { return credits.toFixed(2); }
+    if (credits < 10) { return credits.toFixed(1); }
+    return Math.round(credits).toLocaleString();
   }
 
   private escapeHtml(str: string): string {

@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as yaml from 'js-yaml';
-import { execSync, exec } from 'child_process';
+import { execSync, execFileSync, exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import { RuleLoader, ReviewProfile } from './ruleLoader';
 import { runReview, autoDetectProfile, ReviewSource } from './reviewer';
@@ -19,6 +19,10 @@ import { GitHubClient } from './http/githubClient';
 import { JiraClient } from './http/jiraClient';
 
 const execAsync = promisify(exec);
+// execFile variant: runs git WITHOUT a shell, so format strings like
+// %(refname:short) and branch names are passed literally (no shell parsing of
+// '(' or injection via special chars).
+const execFileAsync = promisify(execFile);
 
 let ruleLoader: RuleLoader | undefined;
 let panelProvider: ReviewPanelProvider;
@@ -70,6 +74,20 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('revvy.reviewFile', async () => {
       await reviewActiveFile();
+    })
+  );
+
+  // ── Panel-driven component-folder review (internal — invoked from the webview) ──
+  context.subscriptions.push(
+    // Throws on failure (no workspace) so the panel can show why.
+    vscode.commands.registerCommand('revvy.listGitFolders', (): RepoNode[] =>
+      findGitRepos(getWorkspaceRoot())
+    )
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('revvy.reviewSelectedFolders', async (folders: string[]) => {
+      await reviewSelectedFolders(folders);
     })
   );
 
@@ -350,7 +368,9 @@ async function reviewDiff() {
   let baseBranch: string | undefined;
   if (mode.includes('Choose')) {
     try {
-      const branches = execSync('git branch -a --format=%(refname:short)', { cwd, encoding: 'utf8' })
+      // execFileSync (no shell) so %(refname:short) isn't parsed as a subshell.
+      const branches = execFileSync('git', ['branch', '-a', '--format=%(refname:short)'], { cwd, encoding: 'utf8' })
+        .toString()
         .split('\n')
         .filter(Boolean);
       baseBranch = await vscode.window.showQuickPick(branches, {
@@ -364,6 +384,133 @@ async function reviewDiff() {
   }
 
   await runReviewWithProgress(profile, () => getGitDiff(cwd, baseBranch), await getSecrets());
+}
+
+/** A git repository discovered under the workspace, for the folder picker tree. */
+interface RepoNode {
+  /** Path relative to the workspace root; '.' for the root repo itself. */
+  path: string;
+  /** Folder basename shown in the tree. */
+  name: string;
+  /** Nesting depth from the workspace root (root = 0) — drives indentation. */
+  depth: number;
+}
+
+// Directories never worth scanning for nested repos (build output, deps, caches).
+const REPO_SCAN_PRUNE = new Set([
+  'node_modules', 'build', 'buildshares', 'dist', 'out', '.cache',
+  'sstate-cache', 'downloads', 'tmp', '.vscode-test',
+]);
+const REPO_SCAN_MAX_DEPTH = 3; // workspace root + 3 levels
+const REPO_SCAN_MAX_REPOS = 200;
+
+function isGitRepo(dir: string): boolean {
+  // A repo has a `.git` dir (normal clone) or `.git` file (submodule/worktree).
+  try { return fs.existsSync(path.join(dir, '.git')); } catch { return false; }
+}
+
+/**
+ * Discover git repositories at and below the workspace root, returned as a flat,
+ * pre-order (parent-before-child) tree. Includes the root repo itself ('.') plus
+ * any nested repos / submodules, so the panel can show the main project and its
+ * components as a checkable tree. Uninitialised submodules (no `.git`) are
+ * skipped — they have nothing to diff.
+ */
+function findGitRepos(root: string): RepoNode[] {
+  const repos: RepoNode[] = [];
+
+  if (isGitRepo(root)) {
+    repos.push({ path: '.', name: path.basename(root), depth: 0 });
+  }
+
+  const walk = (dir: string, rel: string, depth: number): void => {
+    if (depth > REPO_SCAN_MAX_DEPTH || repos.length >= REPO_SCAN_MAX_REPOS) { return; }
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (!e.isDirectory() || e.name.startsWith('.') || REPO_SCAN_PRUNE.has(e.name)) { continue; }
+      if (repos.length >= REPO_SCAN_MAX_REPOS) { return; }
+      const childAbs = path.join(dir, e.name);
+      const childRel = rel ? `${rel}/${e.name}` : e.name;
+      if (isGitRepo(childAbs)) {
+        repos.push({ path: childRel, name: e.name, depth });
+      }
+      walk(childAbs, childRel, depth + 1); // recurse into submodules too
+    }
+  };
+  walk(root, '', 1);
+
+  return repos;
+}
+
+/**
+ * Build one combined diff from the selected repos. Each repo's local changes are
+ * taken as `git diff HEAD` run inside that repo (staged + unstaged, submodule
+ * pointer churn ignored), fully offline. File paths are prefixed with the repo's
+ * relative path so the combined diff stays unambiguous (e.g. HMI_Submodule/x.c)
+ * and the per-file splitter handles it unchanged.
+ */
+async function getCombinedFolderDiff(root: string, relPaths: string[]): Promise<string> {
+  const parts = await Promise.all(
+    relPaths.map(async rel => {
+      const dir    = rel === '.' ? root : path.join(root, rel);
+      const prefix = rel === '.' ? path.basename(root) : rel;
+      try {
+        const { stdout } = await execFileAsync('git', [
+          '-C', dir, 'diff', 'HEAD', '--ignore-submodules=all',
+          `--src-prefix=a/${prefix}/`,
+          `--dst-prefix=b/${prefix}/`,
+        ], { cwd: dir, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+        return (stdout ?? '').trim();
+      } catch (error: any) {
+        const firstLine = String(error.message ?? error).split('\n')[0].trim();
+        throw new Error(`Git diff failed for "${prefix}": ${firstLine}`);
+      }
+    })
+  );
+  return parts.filter(Boolean).join('\n\n').trim();
+}
+
+/**
+ * Run a combined review of the selected repos (panel-driven). Selections are
+ * re-validated against the live repo list so only real repos reach git. Forced
+ * to Quick + contextFromDiff because the repos aren't the open workspace tree.
+ */
+async function reviewSelectedFolders(relPaths: string[]) {
+  if (!Array.isArray(relPaths) || relPaths.length === 0) { return; }
+
+  const loader = await ensureRuleLoader();
+  if (!loader) { return; }
+
+  let profile: ReviewProfile;
+  try {
+    profile = getActiveProfile();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(e.message);
+    return;
+  }
+
+  let root: string;
+  try {
+    root = getWorkspaceRoot();
+  } catch (e: any) {
+    vscode.window.showErrorMessage(e.message);
+    return;
+  }
+
+  const valid = new Set(findGitRepos(root).map(r => r.path));
+  const selected = relPaths.filter(p => valid.has(p));
+  if (selected.length === 0) {
+    vscode.window.showWarningMessage('No valid folders selected.');
+    return;
+  }
+
+  await runReviewWithProgress(
+    profile,
+    () => getCombinedFolderDiff(root, selected),
+    await getSecrets(),
+    { contextFromDiff: true }
+  );
 }
 
 async function reviewActiveFile() {
@@ -404,7 +551,8 @@ async function reviewActiveFile() {
 async function runReviewWithProgress(
   profile: ReviewProfile,
   getDiff: () => Promise<string> | string,
-  keys: AIKeys = {}
+  keys: AIKeys = {},
+  opts: { contextFromDiff?: boolean } = {}
 ) {
   // Inject in-memory requirements if they belong to this profile.
   const profileWithReqs: ReviewProfile =
@@ -444,7 +592,12 @@ async function runReviewWithProgress(
 
       // Step 3: Send to AI — phase transition uses updateLoading (full HTML rebuild),
       // then all high-frequency token updates use patchLoading (postMessage only).
-      const isDeep = extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
+      // Off-tree diffs (multi-branch combined review) force Quick: Deep Review's
+      // file-reading tools operate on the checked-out branch, which wouldn't
+      // match the reviewed branches' diffs.
+      const forceDiffContext = !!opts.contextFromDiff;
+      const isDeep = !forceDiffContext
+        && extensionContext.workspaceState.get<string>('revvy.reviewScope', 'quick') === 'deep';
       progress.report({ message: isDeep ? 'Starting Deep Review…' : 'Analyzing with AI…' });
       panelProvider.updateLoading(isDeep ? 'Starting Deep Review…' : 'Analyzing changes…', 0.5);
 
@@ -498,7 +651,8 @@ async function runReviewWithProgress(
               // Resolve commit-style rules once per review — never for remote reviews
               // (sources=undefined here means this is always a local diff review).
               ruleLoader?.getProfile('commit-style')?.rules.filter(r => r.enabled) ?? [],
-              extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file')
+              extensionContext.workspaceState.get<'per_file' | 'all_in_one'>('revvy.reviewMode', 'per_file'),
+              forceDiffContext
             );
 
         if (result.filterStats && result.filterStats.skippedFiles > 0) {
